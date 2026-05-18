@@ -2,20 +2,33 @@ import os
 import time
 import pandas as pd
 import numpy as np
-from tvDatafeed import TvDatafeed, Interval
+
+# Disabilita l'uso dei segnali se si è su Windows (evita crash legati a signal.alarm)
+import platform
+if platform.system() != 'Windows':
+    import signal
+else:
+    signal = None
+
+# Installazione guidata via codice (opzionale, ma utile per GitHub Actions)
+# Se usi GitHub Actions, è meglio definirle nel file requirements.txt
+try:
+    from tvDatafeed import TvDatafeed, Interval
+except ImportError:
+    os.system('pip install git+https://github.com/rongardF/tvdatafeed.git -q')
+    from tvDatafeed import TvDatafeed, Interval
+
+try:
+    import yfinance as yf
+except ImportError:
+    os.system('pip install yfinance -q')
+    import yfinance as yf
 
 # ============================================================
-# CONFIGURAZIONE FILE STATICI
+# CONFIGURAZIONE FILE INPUT / OUTPUT
 # ============================================================
 INPUT_FILE = "Tadingview_SPNQDW_MIBDAX_assets.txt"
-BODY_THRESHOLD = 70.0
-
-# Ricava il nome base senza estensione per generare il CSV di uscita
-if os.path.exists(INPUT_FILE):
-    title_label = os.path.splitext(os.path.basename(INPUT_FILE))[0]
-    out_csv = f"{title_label}_drawdown_stats.csv"
-else:
-    raise FileNotFoundError(f"Il file di input obbligatorio '{INPUT_FILE}' non è stato trovato nella cartella corrente.")
+OUTPUT_CSV = "Tadingview_SPNQDW_MIBDAX_assets_drawdown_stats.csv"
 
 # ============================================================
 # CONNESSIONE TRADINGVIEW
@@ -23,8 +36,12 @@ else:
 tv = TvDatafeed()
 
 # ============================================================
-# LETTURA TICKER / EXCHANGE
+# STEP 1 & 2: Lettura file specifico ticker/exchange
 # ============================================================
+if not os.path.exists(INPUT_FILE):
+    raise FileNotFoundError(f"Errore: Il file di input '{INPUT_FILE}' non è stato trovato nella directory corrente.")
+
+print(f"Lettura file di input: {INPUT_FILE}")
 with open(INPUT_FILE, 'r') as f:
     lines = [l.strip() for l in f.readlines() if l.strip()]
 
@@ -36,10 +53,10 @@ for line in lines:
     else:
         print(f"  [SKIP] Riga non valida: '{line}'")
 
-print(f"\nTicker caricati: {len(tickers_exchange)}")
+print(f"Ticker caricati con successo: {len(tickers_exchange)}")
 
 # ============================================================
-# HELPER FUNCTIONS
+# HELPER: scarica storico DAILY con timeout e retry
 # ============================================================
 def get_max_history_tv(symbol: str, exchange: str, bars_per_call=5000, max_retries=3, timeout_sec=60):
     prev_len = 0
@@ -47,15 +64,11 @@ def get_max_history_tv(symbol: str, exchange: str, bars_per_call=5000, max_retri
 
     for attempt in range(max_retries + 1):
         try:
-            # Gestione del timeout sicura anche per ambienti non-Linux (es. Windows locale)
-            try:
-                import signal
+            if signal and hasattr(signal, 'SIGALRM'):
                 def _timeout_handler(signum, frame):
                     raise TimeoutError(f"Timeout dopo {timeout_sec}s")
                 signal.signal(signal.SIGALRM, _timeout_handler)
                 signal.alarm(timeout_sec)
-            except AttributeError:
-                pass # signal.SIGALRM non presente su Windows
 
             df = tv.get_hist(
                 symbol=symbol,
@@ -64,10 +77,8 @@ def get_max_history_tv(symbol: str, exchange: str, bars_per_call=5000, max_retri
                 n_bars=n_bars
             )
 
-            try:
-                signal.alarm(0) # Disattiva alarm se supportato
-            except NameError:
-                pass
+            if signal and hasattr(signal, 'SIGALRM'):
+                signal.alarm(0)
 
             if df is None or df.empty:
                 return pd.DataFrame()
@@ -78,9 +89,6 @@ def get_max_history_tv(symbol: str, exchange: str, bars_per_call=5000, max_retri
             prev_len = curr_len
             n_bars  += bars_per_call
 
-        except TimeoutError as e:
-            print(f"    ⏱ {symbol}: {e} — skip")
-            return pd.DataFrame()
         except Exception as e:
             if attempt < max_retries:
                 wait = 3 * (attempt + 1)
@@ -108,17 +116,17 @@ def get_max_history_tv(symbol: str, exchange: str, bars_per_call=5000, max_retri
         print(f"    ✗ {symbol}: errore formattazione dati: {e}")
         return pd.DataFrame()
 
+# ============================================================
+# HELPER: scarica storico WEEKLY
+# ============================================================
 def get_weekly_history_tv(symbol: str, exchange: str, n_bars: int = 100, max_retries: int = 3, timeout_sec: int = 60):
     for attempt in range(max_retries + 1):
         try:
-            try:
-                import signal
+            if signal and hasattr(signal, 'SIGALRM'):
                 def _timeout_handler(signum, frame):
                     raise TimeoutError(f"Timeout weekly dopo {timeout_sec}s")
                 signal.signal(signal.SIGALRM, _timeout_handler)
                 signal.alarm(timeout_sec)
-            except AttributeError:
-                pass
 
             df = tv.get_hist(
                 symbol=symbol,
@@ -127,10 +135,8 @@ def get_weekly_history_tv(symbol: str, exchange: str, n_bars: int = 100, max_ret
                 n_bars=n_bars
             )
 
-            try:
+            if signal and hasattr(signal, 'SIGALRM'):
                 signal.alarm(0)
-            except NameError:
-                pass
 
             if df is None or df.empty:
                 return pd.DataFrame()
@@ -142,16 +148,19 @@ def get_weekly_history_tv(symbol: str, exchange: str, n_bars: int = 100, max_ret
             df_out['Close'] = df['close'].values
             return df_out.sort_index()
 
-        except TimeoutError as e:
-            print(f"    ⏱ {symbol} weekly: {e} — skip")
-            return pd.DataFrame()
         except Exception as e:
             if attempt < max_retries:
                 wait = 3 * (attempt + 1)
                 time.sleep(wait)
             else:
                 return pd.DataFrame()
+
     return pd.DataFrame()
+
+# ============================================================
+# HELPER: calcolo body% candela precedente
+# ============================================================
+BODY_THRESHOLD = 70.0
 
 def calc_body_pct(df_ohlc: pd.DataFrame, bar_index: int = -2):
     try:
@@ -169,6 +178,9 @@ def calc_body_pct(df_ohlc: pd.DataFrame, bar_index: int = -2):
     except Exception:
         return None, 'N/A'
 
+# ============================================================
+# HELPER: calcolo POC
+# ============================================================
 def calculate_single_poc(data, num_bins=50):
     try:
         if not all(c in data.columns for c in ['High', 'Low', 'Volume']):
@@ -205,9 +217,11 @@ def calculate_three_pocs(df):
 def build_tv_link(exchange, ticker):
     return f"https://www.tradingview.com/chart/?symbol={exchange}%3A{ticker}&interval=W"
 
+# ============================================================
+# HELPER: recupero Market Cap via yfinance
+# ============================================================
 def get_market_cap(symbol: str, exchange: str) -> float | None:
     try:
-        import yfinance as yf
         exchange_suffix = {
             'LSE': '.L', 'XETR': '.DE', 'EURONEXT': '.PA', 'BVMF': '.SA',
             'TSX': '.TO', 'ASX': '.AX', 'TYO': '.T', 'HKEX': '.HK',
@@ -225,28 +239,26 @@ def get_market_cap(symbol: str, exchange: str) -> float | None:
 # ============================================================
 # PROCESSING LOOP
 # ============================================================
-results = []
+dist_results = []
+anno_corrente = pd.Timestamp.now().year
 n_total = len(tickers_exchange)
 
-print(f"\nElaborazione {n_total} ticker...")
+print(f"\nElaborazione di {n_total} ticker in corso...")
 
 for i, (symbol, exchange) in enumerate(tickers_exchange, 1):
-    print(f"[{i:3d}/{n_total}] {symbol:10s} ({exchange})", end=" → ", flush=True)
-
+    print(f"[{i}/{n_total}] Elaborazione {symbol} ({exchange})...")
+    
     if i > 1:
         time.sleep(1.5)
 
     try:
         df = get_max_history_tv(symbol, exchange)
         if df.empty:
-            print("SKIP (nessun dato)")
             continue
 
         body_d_pct, body_d_flag = calc_body_pct(df, bar_index=-2)
-
         df_w = get_weekly_history_tv(symbol, exchange, n_bars=100)
         body_w_pct, body_w_flag = calc_body_pct(df_w, bar_index=-2)
-
         market_cap = get_market_cap(symbol, exchange)
 
         years = df.index.year.unique()
@@ -261,18 +273,9 @@ for i, (symbol, exchange) in enumerate(tickers_exchange, 1):
             yearly_mdd.append(abs(yd['Drawdown'].min() * 100))
 
         if not yearly_mdd:
-            print("SKIP (dati insufficienti)")
             continue
 
-        dd_medio    = np.mean(yearly_mdd)
-        dd_massimo  = np.max(yearly_mdd)
-        durata_anni = len(yearly_mdd)
-
-        price_start   = float(df['Price'].iloc[0])
         current_price = float(df['Price'].iloc[-1])
-        n_years       = (df.index[-1] - df.index[0]).days / 365.25
-        cagr = ((current_price / price_start) ** (1 / n_years) - 1) * 100 if n_years > 0 else 0
-
         poc1, poc2, poc3 = calculate_three_pocs(df)
 
         if poc1 is not None and poc2 is not None and poc3 is not None:
@@ -281,43 +284,73 @@ for i, (symbol, exchange) in enumerate(tickers_exchange, 1):
             sopra_3poc = "N/A"
 
         tv_link = build_tv_link(exchange, symbol)
+        ath_price = float(df['Price'].max())
+        dd_da_ath_pct = round(((current_price - ath_price) / ath_price) * 100, 2)
 
-        results.append({
-            'Ticker':        symbol,
-            'Exchange':      exchange,
-            'DD_Medio':      -dd_medio,
-            'Max_DD':        -dd_massimo,
-            'Durata_Anni':   durata_anni,
-            'CAGR':          cagr,
-            'Prezzo':        round(current_price, 2),
-            'POC1':          poc1,
-            'POC2':          poc2,
-            'POC3':          poc3,
-            'Sopra_3POC':    sopra_3poc,
-            'Body_D%':       body_d_pct,
-            'Body_D_Flag':   body_d_flag,
-            'Body_W%':       body_w_pct,
-            'Body_W_Flag':   body_w_flag,
-            'Link_TV_W':     tv_link,
-            'Market_Cap':    market_cap,
-        })
-        print("OK")
+        yd_curr = df[df.index.year == anno_corrente].copy()
+        if len(yd_curr) >= 5:
+            yd_curr['Peak']     = yd_curr['Price'].cummax()
+            yd_curr['Drawdown'] = (yd_curr['Price'] - yd_curr['Peak']) / yd_curr['Peak']
+            dd_corrente         = abs(yd_curr['Drawdown'].min() * 100)
+
+            prezzo_inizio_anno = float(yd_curr['Price'].iloc[0])
+            prezzo_ultimo      = float(yd_curr['Price'].iloc[-1])
+            dd_ytd_pct         = round(((prezzo_ultimo - prezzo_inizio_anno) / prezzo_inizio_anno) * 100, 2)
+
+            hist_mdd = [v for v, yr in zip(yearly_mdd, [y for y in years if len(df[df.index.year==y])>=20]) if yr != anno_corrente]
+
+            if hist_mdd:
+                dd_med_st  = np.mean(hist_mdd)
+                dd_max_st  = np.max(hist_mdd)
+                std_dev    = np.std(hist_mdd)
+                distanza   = dd_corrente - dd_med_st
+                cv         = (std_dev / dd_med_st * 100) if dd_med_st > 0 else 0
+                affid      = max(0, min(100, 100 - cv))
+
+                # Generazione del dataset completo a 22 colonne
+                dist_results.append({
+                    'Ticker':               symbol,
+                    'Exchange':             exchange,
+                    'Prezzo':               round(current_price, 2),
+                    'POC1':                 poc1,
+                    'POC2':                 poc2,
+                    'POC3':                 poc3,
+                    'Sopra_3POC':           sopra_3poc,
+                    'DD_da_ATH%':           dd_da_ath_pct,
+                    'DD_YTD%':              dd_ytd_pct,
+                    f'DD_{anno_corrente}%': round(dd_corrente, 1),
+                    'DD_Medio_Storico%':    round(dd_med_st, 1),
+                    'Max_DD_Storico%':      round(dd_max_st, 1),
+                    'Distanza%':            round(distanza, 1),
+                    'StdDev%':              round(std_dev, 1),
+                    'CV%':                  round(cv, 1),
+                    'Affidabilità%':        round(affid, 1),
+                    'Body_D%':              body_d_pct,
+                    'Body_D_Flag':          body_d_flag,
+                    'Body_W%':              body_w_pct,
+                    'Body_W_Flag':          body_w_flag,
+                    'Link_TV_W':            tv_link,
+                    'Market_Cap':           market_cap
+                })
 
     except Exception as e:
-        print(f"ERR ({e})")
+        print(f"Errore sul ticker {symbol}: {e}")
 
 # ============================================================
-# SALVATAGGIO CSV ESATTO E FINALE
+# SALVATAGGIO CSV (Esattamente le 22 colonne desiderate)
 # ============================================================
-if len(results) == 0:
-    raise RuntimeError("Nessun ticker elaborato con successo. Controlla il file di input.")
+if dist_results:
+    dist_df = pd.DataFrame(dist_results)
+    
+    # Ordinamento opzionale coerente con la logica precedente (Sopra_3POC e performance)
+    if 'Sopra_3POC' in dist_df.columns:
+        dist_df['_sort_flag'] = dist_df['Sopra_3POC'].map({'YES': 0, 'NO': 1, 'N/A': 2})
+        dist_df = dist_df.sort_values(['_sort_flag', 'Ticker'], ascending=[True, True]).drop(columns='_sort_flag')
 
-res_df = pd.DataFrame(results)
-
-# Genera esattamente lo stesso CSV strutturato con round(3), separatore ';' e decimale ','
-res_df.round(3).to_csv(out_csv, index=False, sep=';', decimal=',')
-
-print(f"\n{'='*60}")
-print(f" Elaborazione Completata con Successo!")
-print(f" File di uscita generato: {out_csv}")
-print(f"{'='*60}")
+    # Salvataggio finale
+    dist_df.to_csv(OUTPUT_CSV, index=False, sep=';', decimal=',')
+    print(f"\n[SUCCESS] File generato correttamente: {OUTPUT_CSV}")
+    print(f"Numero totale di colonne: {len(dist_df.columns)} (Dovrebbero essere 22)")
+    print(f"Righe elaborate: {len(dist_df)}")
+else:
+    print("\n[ERROR] Nessun dato estratto. Verifica la connessione o l'integrità del file TXT.")
